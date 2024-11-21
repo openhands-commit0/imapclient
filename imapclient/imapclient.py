@@ -106,7 +106,15 @@ class Quota:
 
 def require_capability(capability):
     """Decorator raising CapabilityError when a capability is not available."""
-    pass
+    def actual_decorator(func):
+        def wrapper(client, *args, **kwargs):
+            if not client.has_capability(capability):
+                raise exceptions.CapabilityError(
+                    f"Server does not support {capability} capability"
+                )
+            return func(client, *args, **kwargs)
+        return wrapper
+    return actual_decorator
 
 class IMAPClient:
     """A connection to the IMAP server specified by *host* is made when
@@ -223,7 +231,7 @@ class IMAPClient:
            This includes reading from and writing to the socket,
            as they are likely to break internal bookkeeping of messages.
         """
-        pass
+        return self._imap.sock
 
     @require_capability('STARTTLS')
     def starttls(self, ssl_context=None):
@@ -243,13 +251,34 @@ class IMAPClient:
         Raises :py:exc:`AbortError` if the server does not support STARTTLS
         or an SSL connection is already established.
         """
-        pass
+        if self.ssl or self._starttls_done:
+            raise self.AbortError('TLS session already established')
+
+        if ssl_context is None:
+            ssl_context = tls.create_default_context()
+
+        typ, data = self._imap._simple_command('STARTTLS')
+        if typ != 'OK':
+            raise self.Error('STARTTLS failed: %s' % data[0].decode('ascii'))
+
+        self._starttls_done = True
+        self._imap.sock = ssl_context.wrap_socket(self._imap.sock,
+                                                server_hostname=self.host)
 
     def login(self, username: str, password: str):
         """Login using *username* and *password*, returning the
         server response.
         """
-        pass
+        try:
+            typ, data = self._imap.login(username, password)
+        except imaplib.IMAP4.error as e:
+            raise self.Error(str(e))
+
+        if typ != 'OK':
+            raise self.Error(data[0].decode('ascii'))
+
+        self._cached_capabilities = None
+        return data[0].decode('ascii')
 
     def oauth2_login(self, user: str, access_token: str, mech: str='XOAUTH2', vendor: Optional[str]=None):
         """Authenticate using the OAUTH2 or XOAUTH2 methods.
@@ -257,7 +286,21 @@ class IMAPClient:
         Gmail and Yahoo both support the 'XOAUTH2' mechanism, but Yahoo requires
         the 'vendor' portion in the payload.
         """
-        pass
+        auth_string = f'user={user}\1auth=Bearer {access_token}\1'
+        if vendor:
+            auth_string += f'vendor={vendor}\1'
+        auth_string += '\1'
+
+        try:
+            typ, data = self._imap.authenticate(mech, lambda _: auth_string.encode())
+        except imaplib.IMAP4.error as e:
+            raise self.Error(str(e))
+
+        if typ != 'OK':
+            raise self.Error(data[0].decode('ascii'))
+
+        self._cached_capabilities = None
+        return data[0].decode('ascii')
 
     def oauthbearer_login(self, identity, access_token):
         """Authenticate using the OAUTHBEARER method.
@@ -265,11 +308,35 @@ class IMAPClient:
         This is supported by Gmail and is meant to supersede the non-standard
         'OAUTH2' and 'XOAUTH2' mechanisms.
         """
-        pass
+        auth_string = f'n,a={identity},\1auth=Bearer {access_token}\1\1'
+
+        try:
+            typ, data = self._imap.authenticate('OAUTHBEARER', lambda _: auth_string.encode())
+        except imaplib.IMAP4.error as e:
+            raise self.Error(str(e))
+
+        if typ != 'OK':
+            raise self.Error(data[0].decode('ascii'))
+
+        self._cached_capabilities = None
+        return data[0].decode('ascii')
 
     def plain_login(self, identity, password, authorization_identity=None):
         """Authenticate using the PLAIN method (requires server support)."""
-        pass
+        if authorization_identity is None:
+            authorization_identity = ''
+        auth_string = f'{authorization_identity}\0{identity}\0{password}'
+
+        try:
+            typ, data = self._imap.authenticate('PLAIN', lambda _: auth_string.encode())
+        except imaplib.IMAP4.error as e:
+            raise self.Error(str(e))
+
+        if typ != 'OK':
+            raise self.Error(data[0].decode('ascii'))
+
+        self._cached_capabilities = None
+        return data[0].decode('ascii')
 
     def sasl_login(self, mech_name, mech_callable):
         """Authenticate using a provided SASL mechanism (requires server support).
@@ -320,11 +387,35 @@ class IMAPClient:
 
             imap.sasl_login("SCRAM-SHA-256", scram_mech)
         """
-        pass
+        def encode_response(response):
+            if isinstance(response, str):
+                return response.encode()
+            return response
+
+        try:
+            typ, data = self._imap.authenticate(mech_name, lambda x: encode_response(mech_callable(x)))
+        except imaplib.IMAP4.error as e:
+            raise self.Error(str(e))
+
+        if typ != 'OK':
+            raise self.Error(data[0].decode('ascii'))
+
+        self._cached_capabilities = None
+        return data[0].decode('ascii')
 
     def logout(self):
         """Logout, returning the server response."""
-        pass
+        try:
+            typ, data = self._imap.logout()
+        except imaplib.IMAP4.error as e:
+            raise self.Error(str(e))
+
+        self.shutdown()
+
+        if typ != 'BYE':
+            raise self.Error(data[0].decode('ascii'))
+
+        return data[0].decode('ascii')
 
     def shutdown(self) -> None:
         """Close the connection to the IMAP server (without logging out)
@@ -332,7 +423,18 @@ class IMAPClient:
         In most cases, :py:meth:`.logout` should be used instead of
         this. The logout method also shutdown down the connection.
         """
-        pass
+        if self._imap.sock is not None:
+            try:
+                self._imap.sock.shutdown(socket.SHUT_RDWR)
+            except Exception:
+                pass
+            finally:
+                try:
+                    self._imap.sock.close()
+                except Exception:
+                    pass
+                self._imap.sock = None
+                self._cached_capabilities = None
 
     @require_capability('ENABLE')
     def enable(self, *capabilities):
@@ -351,7 +453,25 @@ class IMAPClient:
 
         See :rfc:`5161` for more details.
         """
-        pass
+        if not capabilities:
+            raise self.Error('No arguments for ENABLE command')
+
+        try:
+            typ, data = self._imap._simple_command('ENABLE', *capabilities)
+        except imaplib.IMAP4.error as e:
+            raise self.Error(str(e))
+
+        if typ != 'OK':
+            raise self.Error(data[0].decode('ascii'))
+
+        if len(data) != 1:
+            raise self.Error('Invalid ENABLE response')
+
+        response = data[0].decode('ascii')
+        if not response.startswith('* ENABLED '):
+            raise self.Error('Invalid ENABLE response')
+
+        return response[10:].split()
 
     @require_capability('ID')
     def id_(self, parameters=None):
@@ -361,7 +481,42 @@ class IMAPClient:
         *parameters* should be specified as a dictionary of field/value pairs,
         for example: ``{"name": "IMAPClient", "version": "0.12"}``
         """
-        pass
+        if parameters is None:
+            args = ['NIL']
+        else:
+            if not isinstance(parameters, dict):
+                raise TypeError('parameters must be a dict or None')
+            args = []
+            for key, value in parameters.items():
+                args.extend([to_bytes(key), to_bytes(value)])
+
+        try:
+            typ, data = self._imap._simple_command('ID', '(' + ' '.join(args) + ')')
+        except imaplib.IMAP4.error as e:
+            raise self.Error(str(e))
+
+        if typ != 'OK':
+            raise self.Error(data[0].decode('ascii'))
+
+        if len(data) != 1:
+            raise self.Error('Invalid ID response')
+
+        response = data[0].decode('ascii')
+        if not response.startswith('* ID '):
+            raise self.Error('Invalid ID response')
+
+        response = response[5:]
+        if response == 'NIL':
+            return {}
+
+        if not (response.startswith('(') and response.endswith(')')):
+            raise self.Error('Invalid ID response')
+
+        response = response[1:-1].split()
+        if len(response) % 2 != 0:
+            raise self.Error('Invalid ID response')
+
+        return dict(zip(response[::2], response[1::2]))
 
     def capabilities(self):
         """Returns the server capability list.
@@ -375,11 +530,29 @@ class IMAPClient:
         If the session is not yet authenticated, the capabilities
         requested at connection time will be returned.
         """
-        pass
+        if self._cached_capabilities is None:
+            try:
+                typ, data = self._imap.capability()
+            except imaplib.IMAP4.error as e:
+                raise self.Error(str(e))
+
+            if typ != 'OK':
+                raise self.Error(data[0].decode('ascii'))
+
+            if len(data) != 1:
+                raise self.Error('Invalid CAPABILITY response')
+
+            response = data[0].decode('ascii')
+            if not response.startswith('* CAPABILITY '):
+                raise self.Error('Invalid CAPABILITY response')
+
+            self._cached_capabilities = response[13:].split()
+
+        return self._cached_capabilities
 
     def has_capability(self, capability):
         """Return ``True`` if the IMAP server has the given *capability*."""
-        pass
+        return capability.upper() in self.capabilities()
 
     @require_capability('NAMESPACE')
     def namespace(self):
@@ -395,7 +568,63 @@ class IMAPClient:
 
         See :rfc:`2342` for more details.
         """
-        pass
+        try:
+            typ, data = self._imap.namespace()
+        except imaplib.IMAP4.error as e:
+            raise self.Error(str(e))
+
+        if typ != 'OK':
+            raise self.Error(data[0].decode('ascii'))
+
+        if len(data) != 1:
+            raise self.Error('Invalid NAMESPACE response')
+
+        response = data[0].decode('ascii')
+        if not response.startswith('* NAMESPACE '):
+            raise self.Error('Invalid NAMESPACE response')
+
+        response = response[12:]
+        if not (response.startswith('(') and response.endswith(')')):
+            raise self.Error('Invalid NAMESPACE response')
+
+        def parse_namespace(ns_str):
+            if ns_str == 'NIL':
+                return None
+            if not (ns_str.startswith('(') and ns_str.endswith(')')):
+                raise self.Error('Invalid NAMESPACE response')
+            ns_str = ns_str[1:-1]
+            namespaces = []
+            while ns_str:
+                if not (ns_str.startswith('(') and ')' in ns_str):
+                    raise self.Error('Invalid NAMESPACE response')
+                ns_end = ns_str.index(')')
+                ns_part = ns_str[1:ns_end]
+                parts = ns_part.split()
+                if len(parts) != 2:
+                    raise self.Error('Invalid NAMESPACE response')
+                prefix = parts[0].strip('"')
+                separator = parts[1].strip('"')
+                namespaces.append((prefix, separator))
+                ns_str = ns_str[ns_end + 1:].lstrip()
+            return namespaces
+
+        response = response[1:-1]
+        parts = []
+        while response:
+            if response.startswith('NIL'):
+                parts.append(None)
+                response = response[3:].lstrip()
+            else:
+                if not (response.startswith('(') and ')' in response):
+                    raise self.Error('Invalid NAMESPACE response')
+                end = response.index(')')
+                parts.append(parse_namespace(response[:end + 1]))
+                response = response[end + 1:].lstrip()
+
+        if len(parts) != 3:
+            raise self.Error('Invalid NAMESPACE response')
+
+        return Namespace(*parts)
 
     def list_folders(self, directory='', pattern='*'):
         """Get a listing of folders on the server as a list of
@@ -418,7 +647,28 @@ class IMAPClient:
         decoded from modified UTF-7, except if folder_decode is not
         set.
         """
-        pass
+        if self.folder_encode:
+            directory = encode_utf7(directory)
+            pattern = encode_utf7(pattern)
+
+        try:
+            typ, data = self._imap.list(directory, pattern)
+        except imaplib.IMAP4.error as e:
+            raise self.Error(str(e))
+
+        if typ != 'OK':
+            raise self.Error(data[0].decode('ascii'))
+
+        ret = []
+        for response in data:
+            if not response:
+                continue
+            flags, delimiter, name = self._parse_list_response(response)
+            if self.folder_encode:
+                name = decode_utf7(name)
+            ret.append((flags, delimiter, name))
+
+        return ret
 
     @require_capability('XLIST')
     def xlist_folders(self, directory='', pattern='*'):
@@ -450,7 +700,28 @@ class IMAPClient:
         The *directory* and *pattern* arguments are as per
         list_folders().
         """
-        pass
+        if self.folder_encode:
+            directory = encode_utf7(directory)
+            pattern = encode_utf7(pattern)
+
+        try:
+            typ, data = self._imap.xlist(directory, pattern)
+        except imaplib.IMAP4.error as e:
+            raise self.Error(str(e))
+
+        if typ != 'OK':
+            raise self.Error(data[0].decode('ascii'))
+
+        ret = []
+        for response in data:
+            if not response:
+                continue
+            flags, delimiter, name = self._parse_list_response(response)
+            if self.folder_encode:
+                name = decode_utf7(name)
+            ret.append((flags, delimiter, name))
+
+        return ret
 
     def list_sub_folders(self, directory='', pattern='*'):
         """Return a list of subscribed folders on the server as
@@ -459,7 +730,28 @@ class IMAPClient:
         The default behaviour will list all subscribed folders. The
         *directory* and *pattern* arguments are as per list_folders().
         """
-        pass
+        if self.folder_encode:
+            directory = encode_utf7(directory)
+            pattern = encode_utf7(pattern)
+
+        try:
+            typ, data = self._imap.lsub(directory, pattern)
+        except imaplib.IMAP4.error as e:
+            raise self.Error(str(e))
+
+        if typ != 'OK':
+            raise self.Error(data[0].decode('ascii'))
+
+        ret = []
+        for response in data:
+            if not response:
+                continue
+            flags, delimiter, name = self._parse_list_response(response)
+            if self.folder_encode:
+                name = decode_utf7(name)
+            ret.append((flags, delimiter, name))
+
+        return ret
 
     def find_special_folder(self, folder_flag):
         """Try to locate a special folder, like the Sent or Trash folder.
@@ -473,7 +765,30 @@ class IMAPClient:
 
         Returns the name of the folder if found, or None otherwise.
         """
-        pass
+        if self.has_capability('XLIST'):
+            folders = self.xlist_folders()
+        else:
+            folders = self.list_folders()
+
+        # First try to find a folder with the matching flag
+        for flags, delimiter, name in folders:
+            if folder_flag in flags:
+                return name
+
+        # No folder with the matching flag found, try popular namespaces
+        if folder_flag in _POPULAR_SPECIAL_FOLDERS:
+            # Get all folder names in a set for faster lookup
+            folder_names = {name.lower() for _, _, name in folders}
+
+            # Try to find a folder with a popular name
+            for folder_name in _POPULAR_SPECIAL_FOLDERS[folder_flag]:
+                # Try with different namespace prefixes
+                for prefix, suffix in _POPULAR_PERSONAL_NAMESPACES:
+                    test_name = prefix + folder_name + suffix
+                    if test_name.lower() in folder_names:
+                        return test_name
+
+        return None
 
     def select_folder(self, folder, readonly=False):
         """Set the current folder on the server.
@@ -493,7 +808,41 @@ class IMAPClient:
              b'UIDNEXT': 11,
              b'UIDVALIDITY': 1239278212}
         """
-        pass
+        if self.folder_encode:
+            folder = encode_utf7(folder)
+
+        try:
+            typ, data = self._imap.select(folder, readonly)
+        except imaplib.IMAP4.error as e:
+            raise self.Error(str(e))
+
+        if typ != 'OK':
+            raise self.Error(data[0].decode('ascii'))
+
+        result = {}
+        for response in data:
+            if not response:
+                continue
+            match = _RE_SELECT_RESPONSE.match(response)
+            if match:
+                key = match.group('key')
+                if key == b'READ-WRITE':
+                    result[key] = True
+                elif key == b'READ-ONLY':
+                    result[b'READ-WRITE'] = False
+                elif match.group('data'):
+                    result[key] = self._parse_response(match.group('data'))
+            else:
+                key, value = response.split(None, 1)
+                try:
+                    result[key] = int(value)
+                except (ValueError, TypeError):
+                    result[key] = value
+
+        if b'READ-WRITE' not in result:
+            result[b'READ-WRITE'] = not readonly
+
+        return result
 
     @require_capability('UNSELECT')
     def unselect_folder(self):
@@ -504,7 +853,15 @@ class IMAPClient:
 
         Returns the UNSELECT response string returned by the server.
         """
-        pass
+        try:
+            typ, data = self._imap._simple_command('UNSELECT')
+        except imaplib.IMAP4.error as e:
+            raise self.Error(str(e))
+
+        if typ != 'OK':
+            raise self.Error(data[0].decode('ascii'))
+
+        return data[0].decode('ascii')
 
     def noop(self):
         """Execute the NOOP command.
@@ -522,7 +879,15 @@ class IMAPClient:
               (6, b'FETCH', (b'FLAGS', (b'sne',)))])
 
         """
-        pass
+        try:
+            typ, data = self._imap.noop()
+        except imaplib.IMAP4.error as e:
+            raise self.Error(str(e))
+
+        if typ != 'OK':
+            raise self.Error(data[0].decode('ascii'))
+
+        return data[0].decode('ascii'), self._consume_responses()
 
     @require_capability('IDLE')
     def idle(self):
@@ -540,7 +905,18 @@ class IMAPClient:
 
         See :rfc:`2177` for more information about the IDLE extension.
         """
-        pass
+        if self._idle_tag is not None:
+            raise self.Error('Already in IDLE mode')
+
+        try:
+            tag = self._imap._command('IDLE')
+        except imaplib.IMAP4.error as e:
+            raise self.Error(str(e))
+
+        self._idle_tag = tag
+        resp = self._imap._get_response()
+        if resp is not None:
+            raise self.Error('Unexpected IDLE response: %s' % resp)
 
     def _poll_socket(self, sock, timeout=None):
         """
@@ -548,7 +924,15 @@ class IMAPClient:
         This implementation is more scalable because it ALLOWS your process
         to have more than 1024 file descriptors.
         """
-        pass
+        if not POLL_SUPPORT:
+            return self._select_poll_socket(sock, timeout)
+
+        poller = select.poll()
+        poller.register(sock, select.POLLIN)
+
+        timeout_ms = None if timeout is None else int(timeout * 1000)
+        ready = poller.poll(timeout_ms)
+        return bool(ready)
 
     def _select_poll_socket(self, sock, timeout=None):
         """
@@ -557,7 +941,8 @@ class IMAPClient:
         has more than 1024 file descriptors.
         We still need this for Windows and some other niche systems.
         """
-        pass
+        r, _, _ = select.select([sock], [], [], timeout)
+        return bool(r)
 
     @require_capability('IDLE')
     def idle_check(self, timeout=None):
@@ -578,7 +963,17 @@ class IMAPClient:
              (1, b'EXISTS'),
              (1, b'FETCH', (b'FLAGS', (b'\\NotJunk',)))]
         """
-        pass
+        if self._idle_tag is None:
+            raise self.Error('Server not in IDLE mode')
+
+        sock = self.socket()
+        if sock is None:
+            raise self.Error('Socket is closed')
+
+        if not self._poll_socket(sock, timeout):
+            return []
+
+        return self._consume_responses()
 
     @require_capability('IDLE')
     def idle_done(self):
@@ -595,7 +990,21 @@ class IMAPClient:
         any). These are returned in parsed form as per
         ``idle_check()``.
         """
-        pass
+        if self._idle_tag is None:
+            raise self.Error('Server not in IDLE mode')
+
+        self._imap.send(b'DONE\r\n')
+        try:
+            typ, data = self._imap._command_complete(self._idle_tag)
+        except imaplib.IMAP4.error as e:
+            raise self.Error(str(e))
+        finally:
+            self._idle_tag = None
+
+        if typ != 'OK':
+            raise self.Error(data[0].decode('ascii'))
+
+        return data[0].decode('ascii'), self._consume_responses()
 
     def folder_status(self, folder, what=None):
         """Return the status of *folder*.
@@ -607,37 +1016,127 @@ class IMAPClient:
         Returns a dictionary of the status items for the folder with
         keys matching *what*.
         """
-        pass
+        if what is None:
+            what = ('MESSAGES', 'RECENT', 'UIDNEXT', 'UIDVALIDITY', 'UNSEEN')
+
+        if self.folder_encode:
+            folder = encode_utf7(folder)
+
+        try:
+            typ, data = self._imap.status(folder, '(' + ' '.join(what) + ')')
+        except imaplib.IMAP4.error as e:
+            raise self.Error(str(e))
+
+        if typ != 'OK':
+            raise self.Error(data[0].decode('ascii'))
+
+        response = data[0].decode('ascii')
+        if not response.startswith('* STATUS '):
+            raise self.Error('Invalid STATUS response: %s' % response)
+
+        match = _RE_SELECT_RESPONSE.match(response[9:])
+        if not match:
+            raise self.Error('Invalid STATUS response: %s' % response)
+
+        result = {}
+        for key, value in self._parse_response(match.group('data')):
+            result[key] = value
+
+        return result
 
     def close_folder(self):
         """Close the currently selected folder, returning the server
         response string.
         """
-        pass
+        try:
+            typ, data = self._imap.close()
+        except imaplib.IMAP4.error as e:
+            raise self.Error(str(e))
+
+        if typ != 'OK':
+            raise self.Error(data[0].decode('ascii'))
+
+        return data[0].decode('ascii')
 
     def create_folder(self, folder):
         """Create *folder* on the server returning the server response string."""
-        pass
+        if self.folder_encode:
+            folder = encode_utf7(folder)
+
+        try:
+            typ, data = self._imap.create(folder)
+        except imaplib.IMAP4.error as e:
+            raise self.Error(str(e))
+
+        if typ != 'OK':
+            raise self.Error(data[0].decode('ascii'))
+
+        return data[0].decode('ascii')
 
     def rename_folder(self, old_name, new_name):
         """Change the name of a folder on the server."""
-        pass
+        if self.folder_encode:
+            old_name = encode_utf7(old_name)
+            new_name = encode_utf7(new_name)
+
+        try:
+            typ, data = self._imap.rename(old_name, new_name)
+        except imaplib.IMAP4.error as e:
+            raise self.Error(str(e))
+
+        if typ != 'OK':
+            raise self.Error(data[0].decode('ascii'))
+
+        return data[0].decode('ascii')
 
     def delete_folder(self, folder):
         """Delete *folder* on the server returning the server response string."""
-        pass
+        if self.folder_encode:
+            folder = encode_utf7(folder)
+
+        try:
+            typ, data = self._imap.delete(folder)
+        except imaplib.IMAP4.error as e:
+            raise self.Error(str(e))
+
+        if typ != 'OK':
+            raise self.Error(data[0].decode('ascii'))
+
+        return data[0].decode('ascii')
 
     def folder_exists(self, folder):
         """Return ``True`` if *folder* exists on the server."""
-        pass
+        return folder in [name for _, _, name in self.list_folders()]
 
     def subscribe_folder(self, folder):
         """Subscribe to *folder*, returning the server response string."""
-        pass
+        if self.folder_encode:
+            folder = encode_utf7(folder)
+
+        try:
+            typ, data = self._imap.subscribe(folder)
+        except imaplib.IMAP4.error as e:
+            raise self.Error(str(e))
+
+        if typ != 'OK':
+            raise self.Error(data[0].decode('ascii'))
+
+        return data[0].decode('ascii')
 
     def unsubscribe_folder(self, folder):
         """Unsubscribe to *folder*, returning the server response string."""
-        pass
+        if self.folder_encode:
+            folder = encode_utf7(folder)
+
+        try:
+            typ, data = self._imap.unsubscribe(folder)
+        except imaplib.IMAP4.error as e:
+            raise self.Error(str(e))
+
+        if typ != 'OK':
+            raise self.Error(data[0].decode('ascii'))
+
+        return data[0].decode('ascii')
 
     def search(self, criteria='ALL', charset=None):
         """Return a list of messages ids from the currently selected
@@ -699,7 +1198,34 @@ class IMAPClient:
         in the search).
 
         """
-        pass
+        if not criteria:
+            raise self.Error('No search criteria specified')
+
+        if isinstance(criteria, (str, bytes)):
+            criteria = [criteria]
+
+        criteria = _normalise_search_criteria(criteria, charset)
+
+        try:
+            typ, data = self._imap.search(charset or 'US-ASCII', *criteria)
+        except imaplib.IMAP4.error as e:
+            raise self.Error(str(e))
+
+        if typ != 'OK':
+            raise self.Error(data[0].decode('ascii'))
+
+        if not data[0]:
+            return []
+
+        message_ids = [int(i) for i in data[0].split()]
+
+        # Check for MODSEQ in response
+        for response in self._consume_responses():
+            if len(response) == 2 and response[0].upper() == b'MODSEQ':
+                message_ids.modseq = response[1]
+                break
+
+        return message_ids
 
     @require_capability('X-GM-EXT-1')
     def gmail_search(self, query, charset='UTF-8'):
@@ -716,7 +1242,11 @@ class IMAPClient:
         See https://developers.google.com/gmail/imap_extensions#extension_of_the_search_command_x-gm-raw
         for more info.
         """
-        pass
+        if not query:
+            raise self.Error('No search query specified')
+
+        criteria = ['X-GM-RAW', query]
+        return self.search(criteria, charset)
 
     @require_capability('SORT')
     def sort(self, sort_criteria, criteria='ALL', charset='UTF-8'):
@@ -741,7 +1271,34 @@ class IMAPClient:
         Note that SORT is an extension to the IMAP4 standard so it may
         not be supported by all IMAP servers.
         """
-        pass
+        if not sort_criteria:
+            raise self.Error('No sort criteria specified')
+
+        if isinstance(sort_criteria, (str, bytes)):
+            sort_criteria = [sort_criteria]
+
+        sort_criteria = [to_bytes(c) for c in sort_criteria]
+
+        if not criteria:
+            raise self.Error('No search criteria specified')
+
+        if isinstance(criteria, (str, bytes)):
+            criteria = [criteria]
+
+        criteria = _normalise_search_criteria(criteria, charset)
+
+        try:
+            typ, data = self._imap.sort(sort_criteria, charset or 'US-ASCII', *criteria)
+        except imaplib.IMAP4.error as e:
+            raise self.Error(str(e))
+
+        if typ != 'OK':
+            raise self.Error(data[0].decode('ascii'))
+
+        if not data[0]:
+            return []
+
+        return [int(i) for i in data[0].split()]
 
     def thread(self, algorithm='REFERENCES', criteria='ALL', charset='UTF-8'):
         """Return a list of messages threads from the currently
@@ -760,7 +1317,26 @@ class IMAPClient:
 
         See :rfc:`5256` for more details.
         """
-        pass
+        if not criteria:
+            raise self.Error('No search criteria specified')
+
+        if isinstance(criteria, (str, bytes)):
+            criteria = [criteria]
+
+        criteria = _normalise_search_criteria(criteria, charset)
+
+        try:
+            typ, data = self._imap.thread(algorithm.upper(), charset or 'US-ASCII', *criteria)
+        except imaplib.IMAP4.error as e:
+            raise self.Error(str(e))
+
+        if typ != 'OK':
+            raise self.Error(data[0].decode('ascii'))
+
+        if not data[0]:
+            return []
+
+        return parse_message_list(data[0])
 
     def get_flags(self, messages):
         """Return the flags set for each message in *messages* from
@@ -769,7 +1345,8 @@ class IMAPClient:
         The return value is a dictionary structured like this: ``{
         msgid1: (flag1, flag2, ... ), }``.
         """
-        pass
+        response = self.fetch(messages, ['FLAGS'])
+        return {msg_id: flags for msg_id, flags in response.items()}
 
     def add_flags(self, messages, flags, silent=False):
         """Add *flags* to *messages* in the currently selected folder.
